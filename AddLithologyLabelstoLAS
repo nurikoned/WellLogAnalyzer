@@ -1,0 +1,44 @@
+import lasio
+import numpy as np
+
+# Load your LAS file
+las = lasio.read('/content/MARCOUX-1.LAS')
+
+# Check if the LITHOLOGY curve exists; add it if not
+if not any(curve.mnemonic == 'LITHOLOGY' for curve in las.curves):
+    # Initialize lithology with None for all depth values
+    lithology_values = np.full(len(las['DEPTH']), None, dtype=object)
+    # Add the new lithology curve
+    las.append_curve('LITHOLOGY', lithology_values, unit='', descr='Lithology labels')
+
+# Define lithology ranges: (start_depth, end_depth) -> lithology
+lithology_map = {
+    (0, 530): 'Shale',
+    (530, 1448): 'Shale',  # Shale and Lime simplified to Shale
+    (1448, 1820): 'Limestone',
+    (1820, 1955): 'Shale',  # Shale and Lime simplified to Shale
+    (1955, 2640): 'Limestone',
+    (2640, 2760): 'Shale',  # Lime and Shale simplified to Shale
+    (2760, 2900): 'Shale',  # Shale and Lime simplified to Shale
+    (2900, 3435): 'Limestone',
+    (3435, 3790): 'Shale'
+}
+
+# Assign lithology based on depth ranges
+lithology_column = []
+for depth in las['DEPTH']:  # Iterate through depth values
+    lithology_assigned = None
+    for depth_range, lithology in lithology_map.items():
+        if depth_range[0] <= depth < depth_range[1]:
+            lithology_assigned = lithology
+            break
+    lithology_column.append(lithology_assigned)
+
+# Convert the lithology_column list to a NumPy array
+lithology_column = np.array(lithology_column, dtype=object)
+
+# Update the LITHOLOGY curve in the LAS file
+las['LITHOLOGY'] = lithology_column
+
+# Save the modified LAS file
+las.write('MARCOUX-1-NEW.LAS')
