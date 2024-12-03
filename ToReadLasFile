@@ -1,0 +1,15 @@
+import lasio
+
+# Load LAS file
+las = lasio.read("/content/NOEL-POERSCH-1-NEW.LAS")
+
+# Display available data
+print(las.keys())  # Lists well log curve names
+print(las.curves)  # Prints details of curves (e.g., Gamma Ray, Resistivity)
+
+# Convert LAS to DataFrame
+import pandas as pd
+data = las.df()
+
+# Preview data
+print(data.head())
