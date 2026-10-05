@@ -7,136 +7,461 @@ Original file is located at
     https://colab.research.google.com/drive/1CehlEwPz1nguAsyS1yBoLCC57midBC-l
 """
 
-pip install streamlit lasio pandas numpy scikit-learn xgboost matplotlib
+# pip install streamlit lasio pandas numpy scikit-learn xgboost matplotlib
+
+# pip install catboost
+
+# import joblib
+# from xgboost import XGBClassifier # or XGBRegressor, depending on your task
+
+# model = joblib.load('model.pkl')
+
+# joblib.dump(model, 'model.pkl')
+
+# -*- coding: utf-8 -*-
+"""
+Kansas Basin Well Log Analyzer — v64
+==================================================================================
+Streamlit app that loads the trained ensemble from Hugging Face Hub and
+predicts lithology from an uploaded LAS file.
+
+Model:   https://huggingface.co/nurikoned/lithology-v64
+Bundle:  Ensemble_bundle.joblib
+
+Features:
+  • 15 petrophysical features (raw logs + physics transforms + missingness flags)
+  • Weighted ensemble (RandomForest + XGBoost + CatBoost)
+  • Optional 5-sample vertical smoothing
+  • Log-scale resistivity tracks
+  • Minimum-log gate (requires ≥ 5 of the 8 primary logs)
+  • Graceful handling of missing or empty logs
+"""
 
 import streamlit as st
 import lasio
 import pandas as pd
 import numpy as np
-from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import MinMaxScaler
 import joblib
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from io import StringIO
+from matplotlib.patches import Patch
+from io import StringIO, BytesIO, TextIOWrapper
+from pathlib import Path
+from huggingface_hub import hf_hub_download
 
-# Set page title
-st.title("Kansas Basin Well Log Analyzer")
-st.markdown("Upload an LAS file to preprocess, predict lithology labels, and visualize the results.")
 
-# Define features and lithology mapping
-FEATURES = ['GR', 'RHOB', 'RILD', 'DT', 'SP']
-LITHOLOGY_MAPPING = {0: 'Shale', 1: 'Dolomite', 2: 'Limestone', 3: 'Sandstone', 4: 'Siltstone'}
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIG
+# ══════════════════════════════════════════════════════════════════════════════
+HF_REPO_ID     = "nurikoned/lithology-v64"
+MODEL_FILENAME = "Ensemble_bundle.joblib"
 
-# File uploader for LAS file
-uploaded_file = st.file_uploader("Upload an LAS file", type=['las'])
+RAW_LOGS       = ["GR", "RHOB", "RILD", "RILM", "RLL3", "DT", "SP", "SPOR"]
+PHYSICS_FEATS  = ["VSH_LARIONOV", "PHI_D", "SW_ARCHIE"]
+OPTIONAL_LOGS  = ["PE", "NPHI"]
+FLAG_FEATS     = ["has_PE", "has_NPHI"]
 
-if uploaded_file is not None:
-    # Read the LAS file
-    st.subheader("Step 1: Reading the LAS File")
-    las = lasio.read(uploaded_file)
-    df = las.df().reset_index()  # Convert LAS to DataFrame
-    st.write("Original Data Preview:")
-    st.dataframe(df.head())
+PEF_ALIASES    = ["PEF", "PE", "PEFZ", "PDPE", "PEF8"]
+NPHI_ALIASES   = ["NPHI", "NEUT", "TNPH", "NPH", "CNL", "NPHI_LS"]
 
-    # Check if required features are present
-    missing_features = [f for f in FEATURES if f not in df.columns]
-    if missing_features:
-        st.error(f"Missing required features in LAS file: {missing_features}")
-    else:
-        # Preprocessing
-        st.subheader("Step 2: Preprocessing the Data")
+REQUIRED_LOGS     = ["GR", "RHOB", "RILD", "RILM", "RLL3", "DT", "SP", "SPOR"]
+MIN_LOGS_REQUIRED = 5
+MAX_MISSING_FRAC  = 0.80
 
-        # Handle missing values
-        st.write("Handling missing values using median imputation...")
-        imputer = SimpleImputer(strategy='median')
-        df[FEATURES] = imputer.fit_transform(df[FEATURES])
+LITH_COLORS = {
+    "Dolostone": "#e53e3e",
+    "Limestone": "#3182ce",
+    "Sandstone": "#d69e2e",
+    "Shale":     "#38a169",
+    "Siltstone": "#805ad5",
+}
 
-        # Cap outliers in RILD at the 99th percentile
-        st.write("Capping RILD outliers at the 99th percentile...")
-        rild_99th = np.percentile(df['RILD'], 99)
-        df['RILD'] = np.where(df['RILD'] > rild_99th, rild_99th, df['RILD'])
 
-        # Scale features to [0, 1]
-        st.write("Scaling features to [0, 1] range...")
-        scaler = MinMaxScaler()
-        df[FEATURES] = scaler.fit_transform(df[FEATURES])
-
-        st.write("Preprocessed Data Preview:")
-        st.dataframe(df.head())
-
-        # Predict lithology labels
-        st.subheader("Step 3: Predicting Lithology Labels")
-        try:
-            model = joblib.load('xgboost_model.pkl')
-            st.write("Loaded pre-trained XGBoost model.")
-        except FileNotFoundError:
-            st.error("Pre-trained model 'xgboost_model.pkl' not found. Please ensure the model file is in the same directory as this script.")
-            st.stop()
-
-        # Make predictions
-        X = df[FEATURES]
-        predictions = model.predict(X)
-        df['LITHOLOGY'] = [LITHOLOGY_MAPPING[pred] for pred in predictions]
-        st.write("Data with Predicted Lithology Labels:")
-        st.dataframe(df.head())
-
-        # Create new LAS file with predictions
-        st.subheader("Step 4: Generating Output LAS File")
-        las_out = lasio.LASFile()
-
-        # Copy metadata from original LAS file
-        las_out.well = las.well
-        las_out.curves = las.curves
-        las_out.params = las.params
-        las_out.other = las.other
-
-        # Add depth and features to the new LAS file
-        las_out.append_curve('DEPT', df['DEPT'], unit='FT', descr='Depth')
-        for feature in FEATURES:
-            las_out.append_curve(feature, df[feature], unit=las.curves[feature].unit, descr=las.curves[feature].descr)
-
-        # Add predicted lithology as a new curve
-        las_out.append_curve('LITHOLOGY', predictions, unit='', descr='Predicted Lithology (0=Shale, 1=Dolomite, 2=Limestone, 3=Sandstone, 4=Siltstone)')
-
-        # Convert LAS to string for download
-        las_string = StringIO()
-        las_out.write(las_string)
-        las_string.seek(0)
-
-        # Provide download button for the new LAS file
-        st.download_button(
-            label="Download LAS File with Lithology Labels",
-            data=las_string.getvalue(),
-            file_name="output_with_lithology.las",
-            mime="text/plain"
+# ══════════════════════════════════════════════════════════════════════════════
+# LOAD MODEL FROM HUGGING FACE
+# ══════════════════════════════════════════════════════════════════════════════
+@st.cache_resource(show_spinner="Downloading model from Hugging Face …")
+def load_bundle():
+    """Download and cache the trained model bundle from Hugging Face Hub."""
+    try:
+        path = hf_hub_download(
+            repo_id=HF_REPO_ID,
+            filename=MODEL_FILENAME,
+            cache_dir="./hf_cache",
         )
+        return joblib.load(path)
+    except Exception as e:
+        st.error(f"Failed to load model from Hugging Face: {e}")
+        st.error(f"Make sure the repo {HF_REPO_ID} exists and is public.")
+        st.stop()
 
-        # Plotting
-        st.subheader("Step 5: Visualizing Well Logs and Lithology")
-        fig, axes = plt.subplots(nrows=1, ncols=len(FEATURES) + 1, figsize=(15, 10), sharey=True)
 
-        # Plot each feature
-        for i, feature in enumerate(FEATURES):
-            axes[i].plot(df[feature], df['DEPT'], label=feature)
-            axes[i].set_title(feature)
-            axes[i].invert_yaxis()
-            axes[i].grid(True)
-            if i == 0:
-                axes[i].set_ylabel('Depth (ft)')
+# ══════════════════════════════════════════════════════════════════════════════
+# FEATURE ENGINEERING (matches v64 training exactly)
+# ══════════════════════════════════════════════════════════════════════════════
+def _safe_div(a, b, eps=1e-6):
+    return a / (b + eps)
 
-        # Plot lithology
-        lith_colors = {'Shale': 'gray', 'Dolomite': 'blue', 'Limestone': 'green', 'Sandstone': 'yellow', 'Siltstone': 'red'}
-        lith_numeric = df['LITHOLOGY'].map({v: k for k, v in LITHOLOGY_MAPPING.items()})
-        axes[-1].scatter(lith_numeric, df['DEPT'], c=df['LITHOLOGY'].map(lith_colors), label='Lithology')
-        axes[-1].set_title('Lithology')
-        axes[-1].set_xticks(range(len(LITHOLOGY_MAPPING)))
-        axes[-1].set_xticklabels(LITHOLOGY_MAPPING.values(), rotation=45)
-        axes[-1].invert_yaxis()
-        axes[-1].grid(True)
 
-        plt.tight_layout()
-        st.pyplot(fig)
+def _rename_alias(df, target, aliases):
+    if target in df.columns:
+        return
+    for a in aliases:
+        if a in df.columns and a != target:
+            df[target] = df[a]
+            return
 
-else:
+
+def engineer_features(df, well_name="well"):
+    """Reproduce v64 feature engineering on a single uploaded well."""
+    df = df.copy()
+    df["File Name"] = well_name
+
+    # LAS alias renaming
+    _rename_alias(df, "PE",   PEF_ALIASES)
+    _rename_alias(df, "NPHI", NPHI_ALIASES)
+    if "PE" not in df.columns and "PEF" in df.columns:
+        df["PE"] = df["PEF"]
+
+    # Numeric coercion
+    for col in RAW_LOGS + ["PE", "NPHI", "DEPT"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Missingness flags (BEFORE any transformation)
+    df["has_PE"]   = df["PE"].notna().astype(np.int8)   if "PE"   in df.columns else 0
+    df["has_NPHI"] = df["NPHI"].notna().astype(np.int8) if "NPHI" in df.columns else 0
+
+    # VSH (Larionov)
+    if "GR" in df.columns and df["GR"].notna().any():
+        gr_min = df["GR"].min()
+        gr_max = df["GR"].max()
+        df["IGR"] = _safe_div(df["GR"] - gr_min, gr_max - gr_min)
+        df["VSH_LARIONOV"] = (0.083 * (2.0 ** (3.7 * df["IGR"]) - 1.0)).clip(0, 1)
+
+    # Density porosity
+    if "RHOB" in df.columns:
+        df["PHI_D"] = np.clip(_safe_div(2.65 - df["RHOB"], 2.65 - 1.0), 0, 0.45)
+
+    # Archie water saturation
+    if "RILD" in df.columns and "PHI_D" in df.columns:
+        Sw = np.sqrt(_safe_div(0.1, df["RILD"].clip(1e-2, None))
+                     * _safe_div(1.0, df["PHI_D"] ** 2 + 1e-6))
+        df["SW_ARCHIE"] = Sw.clip(0, 1.5)
+
+    # Clip optional logs
+    if "PE" in df.columns:
+        df["PE"] = df["PE"].clip(0.1, 20.0)
+    if "NPHI" in df.columns:
+        df["NPHI"] = df["NPHI"].clip(-0.15, 1.0)
+
+    # Sort by depth
+    if "DEPT" in df.columns:
+        df = df.sort_values("DEPT").reset_index(drop=True)
+
+    return df
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ENSEMBLE PREDICTION
+# ══════════════════════════════════════════════════════════════════════════════
+def predict_lithology(df, bundle, smooth=True, smooth_window=5):
+    """
+    Apply the v64 ensemble. Returns df with added columns:
+      LITHOLOGY, CONFIDENCE, P_<class> for each class.
+    """
+    value_cols = bundle.get("value_cols")
+    flag_cols  = bundle.get("flag_cols")
+
+    # Fallback: if bundle uses a simpler schema
+    if value_cols is None or flag_cols is None:
+        feature_names = bundle["feature_names"]
+        value_cols = [c for c in feature_names if c not in FLAG_FEATS]
+        flag_cols  = [c for c in feature_names if c in FLAG_FEATS]
+
+    imputer = bundle["imputer"]
+    models  = bundle["models"]
+    weights = bundle["ensemble_weights"]
+    le      = bundle["label_encoder"]
+
+    # Ensure every expected column exists
+    for c in value_cols:
+        if c not in df.columns:
+            df[c] = np.nan
+    for c in flag_cols:
+        if c not in df.columns:
+            df[c] = 0
+
+    # Impute values, keep flags raw, hstack
+    X_v = imputer.transform(df[value_cols].values)
+    X_f = df[flag_cols].values.astype(np.float32) if flag_cols else np.zeros((len(df), 0), np.float32)
+    X   = np.hstack([X_v, X_f])
+
+    # Weighted ensemble
+    ens = None
+    for name, w in weights.items():
+        p = models[name].predict_proba(X)
+        ens = p * w if ens is None else ens + p * w
+    ens = ens / ens.sum(1, keepdims=True)
+
+    # Optional smoothing
+    if smooth and smooth_window > 1:
+        pdf = pd.DataFrame(ens)
+        sm  = pdf.rolling(window=smooth_window, center=True, min_periods=1).mean().values
+        sm  = sm / np.clip(sm.sum(1, keepdims=True), 1e-9, None)
+        ens = sm
+
+    pred = ens.argmax(1)
+    df["LITHOLOGY"]  = le.inverse_transform(pred)
+    df["CONFIDENCE"] = ens.max(1).round(3)
+    for i, cls in enumerate(le.classes_):
+        df[f"P_{cls}"] = ens[:, i].round(3)
+    return df
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LOG AVAILABILITY GATE
+# ══════════════════════════════════════════════════════════════════════════════
+def check_log_availability(df):
+    present, missing = [], []
+    for col in REQUIRED_LOGS:
+        if col in df.columns and df[col].notna().mean() > 0.10:
+            present.append(col)
+        else:
+            missing.append(col)
+    return present, missing
+
+
+def usable_logs_for_plot(df):
+    """Logs present with less than MAX_MISSING_FRAC missing values."""
+    usable = []
+    for col in df.columns:
+        if col in ("DEPT", "File Name", "LITHOLOGY", "CONFIDENCE",
+                   "has_PE", "has_NPHI"):
+            continue
+        if col.startswith("P_"):
+            continue
+        if pd.api.types.is_numeric_dtype(df[col]):
+            if df[col].isna().mean() < MAX_MISSING_FRAC:
+                usable.append(col)
+    return usable
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PLOTTING
+# ══════════════════════════════════════════════════════════════════════════════
+def plot_logs_with_lithology(df, depth_range, logs_to_plot):
+    n = len(logs_to_plot)
+    fig, axes = plt.subplots(1, n + 1, figsize=(3 + 2.2 * n, 12), sharey=True)
+    axes = np.atleast_1d(axes)
+    sub = df[(df["DEPT"] >= depth_range[0]) & (df["DEPT"] <= depth_range[1])]
+
+    for i, log in enumerate(logs_to_plot):
+        ax = axes[i]
+        ax.plot(sub[log], sub["DEPT"], color="#2b6cb0", lw=0.8)
+        ax.set_title(log, fontsize=10)
+        ax.grid(alpha=0.3)
+        if log in ("RILD", "RILM", "RLL3"):
+            ax.set_xscale("log")
+        if i == 0:
+            ax.set_ylabel("Depth (ft)")
+
+    ax_lith = axes[-1]
+    for _, row in sub.iterrows():
+        ax_lith.barh(row["DEPT"], 1.0, height=1.5,
+                     color=LITH_COLORS.get(row["LITHOLOGY"], "#888"),
+                     edgecolor="none")
+    ax_lith.set_xlim(0, 1)
+    ax_lith.set_xticks([])
+    ax_lith.set_title("Lithology", fontsize=10)
+    handles = [Patch(facecolor=c, label=n_) for n_, c in LITH_COLORS.items()]
+    ax_lith.legend(handles=handles, loc="upper right", fontsize=8)
+
+    plt.tight_layout()
+    return fig
+
+
+def plot_lithology_only(df, depth_range):
+    sub = df[(df["DEPT"] >= depth_range[0]) & (df["DEPT"] <= depth_range[1])]
+    fig, ax = plt.subplots(figsize=(4, 14))
+    runs, cur, start, prev = [], None, None, None
+    for _, row in sub.iterrows():
+        lab = row["LITHOLOGY"]
+        if lab != cur:
+            if cur is not None:
+                runs.append((start, prev, cur))
+            cur, start = lab, row["DEPT"]
+        prev = row["DEPT"]
+    if cur is not None:
+        runs.append((start, prev, cur))
+
+    for s, e, lab in runs:
+        ax.barh((s + e) / 2.0, 1.0, height=(e - s),
+                color=LITH_COLORS.get(lab, "#888"),
+                edgecolor="k", lw=0.4)
+    ax.set_xlim(0, 1)
+    ax.set_xticks([])
+    ax.invert_yaxis()
+    ax.set_ylabel("Depth (ft)")
+    ax.set_title("Lithology")
+    handles = [Patch(facecolor=c, label=n_) for n_, c in LITH_COLORS.items()]
+    ax.legend(handles=handles, loc="upper right", fontsize=9)
+    plt.tight_layout()
+    return fig
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# APP
+# ══════════════════════════════════════════════════════════════════════════════
+st.set_page_config(page_title="Kansas Basin Well Log Analyzer", layout="wide")
+st.title("Kansas Basin Well Log Analyzer")
+st.markdown(
+    "Upload an LAS file to predict lithology using the v64 well-blind ensemble. "
+    f"The model uses 15 petrophysical features and requires at least "
+    f"{MIN_LOGS_REQUIRED} of the 8 primary logs."
+)
+
+# Load model
+bundle = load_bundle()
+
+# Sidebar — model info
+st.sidebar.header("Model")
+st.sidebar.markdown(f"**Source:** [`{HF_REPO_ID}`](https://huggingface.co/{HF_REPO_ID})")
+st.sidebar.markdown(f"**Winner:** `{bundle.get('winner', 'Ensemble')}`")
+if "ensemble_weights" in bundle:
+    st.sidebar.markdown("**Ensemble weights:**")
+    for n, w in bundle["ensemble_weights"].items():
+        st.sidebar.markdown(f"- {n}: {w:.3f}")
+st.sidebar.markdown(f"**Features:** {len(bundle['feature_names'])}")
+
+# File upload
+uploaded = st.file_uploader("Upload an LAS file", type=["las"])
+if uploaded is None:
     st.info("Please upload an LAS file to begin.")
+    st.stop()
+
+# Read LAS
+try:
+    file_bytes = uploaded.read()
+    text_stream = TextIOWrapper(BytesIO(file_bytes), encoding="utf-8")
+    las = lasio.read(text_stream)
+    df_raw = las.df().reset_index()
+    df_raw.columns = [c.upper() for c in df_raw.columns]
+except Exception as e:
+    st.error(f"Could not read LAS file: {e}")
+    st.stop()
+
+# Rename depth column
+if "DEPTH" in df_raw.columns and "DEPT" not in df_raw.columns:
+    df_raw = df_raw.rename(columns={"DEPTH": "DEPT"})
+if "DEPT" not in df_raw.columns:
+    st.error("No DEPT/DEPTH column found in the LAS file.")
+    st.stop()
+
+well_name = Path(uploaded.name).stem
+
+# Log availability check
+st.subheader("1. Log availability")
+usable = usable_logs_for_plot(df_raw)
+st.write(f"Usable logs: {', '.join(usable) if usable else 'none'}")
+
+present, missing = check_log_availability(df_raw)
+if len(present) < MIN_LOGS_REQUIRED:
+    st.error(
+        f"Only {len(present)} of the {MIN_LOGS_REQUIRED} required primary logs are present "
+        f"({', '.join(present) or 'none'}). "
+        f"Missing: {', '.join(missing)}. "
+        "Predictions would be unreliable — please provide a more complete LAS file."
+    )
+    st.stop()
+
+st.success(f"{len(present)} of {len(REQUIRED_LOGS)} primary logs present — proceeding.")
+
+# Feature engineering + prediction
+with st.spinner("Engineering features and predicting …"):
+    df_feat = engineer_features(df_raw, well_name=well_name)
+    df_pred = predict_lithology(df_feat, bundle, smooth=True, smooth_window=5)
+
+# Results table
+st.subheader("2. Predictions")
+show_cols = ["DEPT", "LITHOLOGY", "CONFIDENCE"] + \
+            [c for c in df_pred.columns if c.startswith("P_")]
+st.dataframe(df_pred[show_cols].head(200), use_container_width=True)
+
+class_counts = df_pred["LITHOLOGY"].value_counts()
+st.markdown(
+    "**Class distribution:**  " +
+    "  ·  ".join(f"{c}: {n}" for c, n in class_counts.items())
+)
+
+# Depth slider
+st.subheader("3. Visualise logs and predicted lithology")
+min_d = float(df_pred["DEPT"].min())
+max_d = float(df_pred["DEPT"].max())
+if max_d - min_d < 1:
+    st.warning("Depth range too small.")
+    st.stop()
+
+depth_range = st.slider(
+    "Depth range (ft)",
+    min_value=min_d, max_value=max_d,
+    value=(min_d, max_d), step=5.0,
+)
+
+plot_type = st.radio(
+    "Plot type",
+    ["Logs + lithology column", "Lithology column only"],
+)
+
+if plot_type == "Logs + lithology column":
+    default_logs = [l for l in ["GR", "RHOB", "RILD", "DT"] if l in usable]
+    logs_to_plot = st.multiselect(
+        "Select logs to display",
+        options=usable,
+        default=default_logs,
+    )
+    if logs_to_plot:
+        fig = plot_logs_with_lithology(df_pred, depth_range, logs_to_plot)
+        st.pyplot(fig)
+    else:
+        st.info("Select at least one log.")
+else:
+    fig = plot_lithology_only(df_pred, depth_range)
+    st.pyplot(fig)
+
+# Downloads
+st.subheader("4. Download results")
+out_csv = df_pred[show_cols].to_csv(index=False)
+st.download_button(
+    "Download predictions (CSV)",
+    data=out_csv,
+    file_name=f"{well_name}_lithology_predictions.csv",
+    mime="text/csv",
+)
+
+# LAS export
+try:
+    las_out = lasio.LASFile()
+    las_out.well = las.well
+    las_out.params = las.params
+    las_out.other = las.other
+    las_out.append_curve("DEPT", df_pred["DEPT"].values, unit="FT", descr="Depth")
+    for col in usable:
+        if col in df_pred.columns:
+            las_out.append_curve(col, df_pred[col].values, unit="", descr=col)
+    le = bundle["label_encoder"]
+    lith_num = le.transform(df_pred["LITHOLOGY"].values)
+    las_out.append_curve("LITHOLOGY", lith_num, unit="", descr="Predicted lithology")
+
+    las_str = StringIO()
+    las_out.write(las_str)
+    st.download_button(
+        "Download predictions (LAS)",
+        data=las_str.getvalue(),
+        file_name=f"{well_name}_lithology.las",
+        mime="text/plain",
+    )
+except Exception as e:
+    st.warning(f"Could not build LAS export: {e}")
 
