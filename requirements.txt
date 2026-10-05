@@ -4,8 +4,9 @@ pandas
 numpy
 matplotlib
 joblib
-scikit-learn
-xgboost
-catboost
-lightgbm
+scikit-learn==1.7.2
+xgboost==3.0.0
+catboost==1.2.7
+lightgbm==4.5.0
 huggingface_hub
+pyarrow<25
