@@ -19,7 +19,7 @@ Original file is located at
 # joblib.dump(model, 'model.pkl')
 
 # -*- coding: utf-8 -*-
-"""Kansas Basin Well Log Analyzer — v64 bundle"""
+"""Kansas Basin Well Log Analyzer — v64 with uncertainty flagging"""
 
 import streamlit as st
 import lasio
@@ -30,10 +30,11 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
-from io import BytesIO, TextIOWrapper, StringIO
+from io import BytesIO, TextIOWrapper
 from pathlib import Path
 from huggingface_hub import hf_hub_download
 
+# ── Config ──────────────────────────────────────────────────────────────────
 HF_REPO_ID     = "nurikoned/lithology-v64"
 MODEL_FILENAME = "Ensemble_bundle.joblib"
 
@@ -46,28 +47,37 @@ RESISTIVITY   = ["RILD", "RILM", "RLL3"]
 
 DEFAULT_COLORS = {
     "Dolostone": "#e53e3e", "Limestone": "#3182ce",
-    "Sandstone": "#d69e2e", "Shale": "#38a169", "Siltstone": "#805ad5",
+    "Sandstone": "#d69e2e", "Shale":     "#38a169",
 }
-FALLBACK = ["#4c51bf", "#dd6b20", "#38a169", "#805ad5",
-            "#e53e3e", "#3182ce", "#d69e2e", "#2c7a7b"]
-LITH_COLORS = {}
+FALLBACK = ["#4c51bf", "#dd6b20", "#38a169", "#805ad5"]
+
+# Thresholds for the "uncertain" flag
+CONF_THRESHOLD   = 0.60   # max prob below this → uncertain
+ENTROPY_THRESH   = 0.80   # normalised entropy above this → uncertain
+MARGIN_THRESHOLD = 0.15   # top-two margin below this → uncertain
+MIN_SIGNALS      = 2      # at least this many signals must fire
 
 
+# ── Load model ──────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner="Downloading model from Hugging Face …")
 def load_bundle():
-    path = hf_hub_download(
-        repo_id=HF_REPO_ID, filename=MODEL_FILENAME, cache_dir="./hf_cache")
+    path = hf_hub_download(repo_id=HF_REPO_ID, filename=MODEL_FILENAME,
+                           cache_dir="./hf_cache")
     return joblib.load(path)
 
 
-def _div(a, b, eps=1e-6): return a / (b + eps)
+# ── Feature engineering (v64) ───────────────────────────────────────────────
+def _div(a, b, eps=1e-6):
+    return a / (b + eps)
 
 
 def _alias(df, target, aliases):
-    if target in df.columns: return
+    if target in df.columns:
+        return
     for a in aliases:
         if a in df.columns:
-            df[target] = df[a]; return
+            df[target] = df[a]
+            return
 
 
 def engineer(df, well_name="well"):
@@ -99,14 +109,17 @@ def engineer(df, well_name="well"):
                      * _div(1.0, df["PHI_D"] ** 2 + 1e-6))
         df["SW_ARCHIE"] = Sw.clip(0, 1.5)
 
-    if "PE" in df.columns:   df["PE"]   = df["PE"].clip(0.1, 20.0)
-    if "NPHI" in df.columns: df["NPHI"] = df["NPHI"].clip(-0.15, 1.0)
+    if "PE" in df.columns:
+        df["PE"] = df["PE"].clip(0.1, 20.0)
+    if "NPHI" in df.columns:
+        df["NPHI"] = df["NPHI"].clip(-0.15, 1.0)
 
     if "DEPT" in df.columns:
         df = df.sort_values("DEPT").reset_index(drop=True)
     return df
 
 
+# ── Predict with ensemble ───────────────────────────────────────────────────
 def predict(df, bundle):
     value_cols = bundle["value_cols"]
     flag_cols  = bundle["flag_cols"]
@@ -118,9 +131,11 @@ def predict(df, bundle):
     win        = bundle.get("smooth_window", 5)
 
     for c in value_cols:
-        if c not in df.columns: df[c] = np.nan
+        if c not in df.columns:
+            df[c] = np.nan
     for c in flag_cols:
-        if c not in df.columns: df[c] = 0
+        if c not in df.columns:
+            df[c] = 0
 
     Xv = imputer.transform(df[value_cols].values)
     Xf = df[flag_cols].values.astype(np.float32)
@@ -146,106 +161,205 @@ def predict(df, bundle):
     return df
 
 
-# ══════════════════════════════════════════════════════════════════════════
+# ── Uncertainty flagging ────────────────────────────────────────────────────
+def add_uncertainty_flag(df, class_names):
+    """
+    Compute three uncertainty signals; mark a sample as 'Unknown' when at
+    least two of them fire. The original predicted class is preserved
+    in PRED_ORIG so the user can still see the model's best guess.
+    """
+    p_cols = [f"P_{c}" for c in class_names]
+    P = df[p_cols].values.astype(np.float64)
+    eps = 1e-9
+
+    max_conf = P.max(1)
+    entropy  = -(P * np.log(P + eps)).sum(1) / np.log(P.shape[1])
+    p_sorted = np.sort(P, axis=1)[:, ::-1]
+    margin   = p_sorted[:, 0] - p_sorted[:, 1]
+
+    sig_conf    = (max_conf < CONF_THRESHOLD).astype(int)
+    sig_entropy = (entropy  > ENTROPY_THRESH).astype(int)
+    sig_margin  = (margin   < MARGIN_THRESHOLD).astype(int)
+    flag        = (sig_conf + sig_entropy + sig_margin) >= MIN_SIGNALS
+
+    df["PRED_ORIG"] = df["LITHOLOGY"].copy()
+    df["UNCERTAIN"] = flag
+    df.loc[flag, "LITHOLOGY"] = "Unknown"
+    return df
+
+
+# ── App ─────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Kansas Basin Well Log Analyzer", layout="wide")
 st.title("Kansas Basin Well Log Analyzer")
-st.markdown("Upload an LAS file to predict lithology (v64 well-blind ensemble).")
+st.markdown("Upload an LAS file to predict lithology.")
 
 bundle = load_bundle()
-classes = list(bundle["label_encoder"].classes_)
-LITH_COLORS.clear()
-for i, c in enumerate(classes):
-    LITH_COLORS[c] = DEFAULT_COLORS.get(c, FALLBACK[i % len(FALLBACK)])
+class_names = list(bundle["label_encoder"].classes_)
 
-st.sidebar.header("Model")
-st.sidebar.markdown(f"**Source:** `{HF_REPO_ID}`")
-st.sidebar.markdown(f"**Winner:** `{bundle.get('winner')}`")
-st.sidebar.markdown(f"**Models:** {', '.join(bundle['model_names'])}")
-st.sidebar.markdown(f"**Features:** {len(bundle['feature_names'])}")
-st.sidebar.markdown(f"**Classes ({len(classes)}):** {', '.join(classes)}")
+# Colour map: known classes get their fixed colour; Unknown is grey hatched
+LITH_COLORS = {c: DEFAULT_COLORS.get(c, FALLBACK[i % len(FALLBACK)])
+               for i, c in enumerate(class_names)}
+LITH_COLORS["Unknown"] = "#bbbbbb"
 
-up = st.file_uploader("Upload an LAS file", type=["las"])
-if up is None:
+# File upload
+uploaded = st.file_uploader("Upload an LAS file", type=["las"])
+if uploaded is None:
     st.info("Please upload an LAS file to begin.")
     st.stop()
 
+# Read LAS
 try:
-    txt = TextIOWrapper(BytesIO(up.read()), encoding="utf-8")
+    txt = TextIOWrapper(BytesIO(uploaded.read()), encoding="utf-8")
     las = lasio.read(txt)
     df_raw = las.df().reset_index()
     df_raw.columns = [c.upper() for c in df_raw.columns]
 except Exception as e:
-    st.error(f"Could not read LAS: {e}"); st.stop()
+    st.error(f"Could not read LAS file: {e}")
+    st.stop()
 
 if "DEPTH" in df_raw.columns and "DEPT" not in df_raw.columns:
     df_raw = df_raw.rename(columns={"DEPTH": "DEPT"})
 if "DEPT" not in df_raw.columns:
-    st.error("No DEPT/DEPTH column."); st.stop()
+    st.error("No DEPT/DEPTH column found in the LAS file.")
+    st.stop()
 
+# Log availability
 present = [c for c in REQUIRED if c in df_raw.columns and df_raw[c].notna().mean() > 0.10]
 missing = [c for c in REQUIRED if c not in present]
 st.subheader("1. Log availability")
-st.write(f"Usable: {', '.join(present) if present else 'none'}")
+st.write(f"Usable logs: {', '.join(present) if present else 'none'}")
 if len(present) < MIN_LOGS:
-    st.error(f"Need at least {MIN_LOGS} logs. Missing: {', '.join(missing)}")
+    st.error(f"Need at least {MIN_LOGS} of the primary logs. "
+             f"Missing: {', '.join(missing)}.")
     st.stop()
-st.success(f"{len(present)} of {len(REQUIRED)} logs present.")
+st.success(f"{len(present)} of {len(REQUIRED)} logs present — proceeding.")
 
-well = Path(up.name).stem
+well = Path(uploaded.name).stem
+
+# Predict
 with st.spinner("Predicting …"):
     df_pred = predict(engineer(df_raw, well), bundle)
+    df_pred = add_uncertainty_flag(df_pred, class_names)
 
+# Uncertain warning
+n_unc = int(df_pred["UNCERTAIN"].sum())
+if n_unc:
+    st.warning(
+        f"{n_unc} of {len(df_pred):,} samples ({100*n_unc/len(df_pred):.1f} %) "
+        "are flagged as **Unknown** — the model is uncertain about those depths, "
+        "which may indicate a lithology outside the 4-class training set "
+        "(e.g. siltstone, coal, evaporite) or thin transitional beds."
+    )
+
+# Results table
 st.subheader("2. Predictions")
-show = ["DEPT", "LITHOLOGY", "CONFIDENCE"] + [c for c in df_pred.columns if c.startswith("P_")]
-st.dataframe(df_pred[show].head(200), use_container_width=True)
-st.markdown("**Class distribution:**  " +
-            "  ·  ".join(f"{c}: {n}" for c, n in df_pred["LITHOLOGY"].value_counts().items()))
+show_cols = ["DEPT", "LITHOLOGY", "CONFIDENCE", "PRED_ORIG"] + \
+            [f"P_{c}" for c in class_names]
+st.dataframe(df_pred[show_cols].head(300), use_container_width=True)
 
+# Class distribution
+counts = df_pred["LITHOLOGY"].value_counts()
+st.markdown("**Class distribution:**  " +
+            "  ·  ".join(f"{c}: {n}" for c, n in counts.items()))
+
+# Visualise
 st.subheader("3. Visualise")
-d0, d1 = float(df_pred["DEPT"].min()), float(df_pred["DEPT"].max())
-dr = st.slider("Depth range", min_value=d0, max_value=d1, value=(d0, d1), step=5.0)
+d0 = float(df_pred["DEPT"].min())
+d1 = float(df_pred["DEPT"].max())
+if d1 - d0 < 1:
+    st.warning("Depth range too small.")
+    st.stop()
+
+dr = st.slider("Depth range (ft)", min_value=d0, max_value=d1,
+               value=(d0, d1), step=5.0)
 sub = df_pred[(df_pred["DEPT"] >= dr[0]) & (df_pred["DEPT"] <= dr[1])]
 
 plot_type = st.radio("Plot type", ["Logs + lithology", "Lithology only"])
+
 if plot_type == "Logs + lithology":
     usable = [c for c in present if c in df_pred.columns]
-    sel = st.multiselect("Logs", options=usable,
-                         default=[c for c in ["GR", "RHOB", "RILD", "DT"] if c in usable])
+    default = [c for c in ["GR", "RHOB", "RILD", "DT"] if c in usable]
+    sel = st.multiselect("Logs to display", options=usable, default=default)
+
     if sel:
-        fig, ax = plt.subplots(1, len(sel) + 1, figsize=(3 + 2.2 * len(sel), 12), sharey=True)
+        n = len(sel)
+        fig, ax = plt.subplots(1, n + 1, figsize=(3 + 2.2 * n, 12), sharey=True)
         ax = np.atleast_1d(ax)
+
         for i, L in enumerate(sel):
             ax[i].plot(sub[L], sub["DEPT"], color="#2b6cb0", lw=0.8)
-            ax[i].set_title(L, fontsize=10); ax[i].grid(alpha=0.3)
-            if L in RESISTIVITY: ax[i].set_xscale("log")
-            if i == 0: ax[i].set_ylabel("Depth (ft)")
-        ax[-1].set_xlim(0, 1); ax[-1].set_xticks([]); ax[-1].set_title("Lithology")
-        for _, r in sub.iterrows():
-            ax[-1].barh(r["DEPT"], 1.0, height=1.5,
-                        color=LITH_COLORS.get(r["LITHOLOGY"], "#888"))
-        ax[-1].legend(handles=[Patch(facecolor=c, label=n) for n, c in LITH_COLORS.items()],
-                      loc="upper right", fontsize=8)
-        plt.tight_layout(); st.pyplot(fig)
+            ax[i].set_title(L, fontsize=10)
+            ax[i].grid(alpha=0.3)
+            if L in RESISTIVITY:
+                ax[i].set_xscale("log")
+            if i == 0:
+                ax[i].set_ylabel("Depth (ft)")
+
+        ax_lith = ax[-1]
+        for _, row in sub.iterrows():
+            if row["UNCERTAIN"]:
+                ax_lith.barh(row["DEPT"], 1.0, height=1.5,
+                             color="#bbbbbb", edgecolor="#666",
+                             hatch="//", linewidth=0.3)
+            else:
+                ax_lith.barh(row["DEPT"], 1.0, height=1.5,
+                             color=LITH_COLORS.get(row["LITHOLOGY"], "#888"))
+        ax_lith.set_xlim(0, 1)
+        ax_lith.set_xticks([])
+        ax_lith.set_title("Lithology", fontsize=10)
+
+        handles = [Patch(facecolor=LITH_COLORS[c], label=c) for c in class_names]
+        handles.append(Patch(facecolor="#bbbbbb", edgecolor="#666",
+                             hatch="//", label="Unknown"))
+        ax_lith.legend(handles=handles, loc="upper right", fontsize=8)
+
+        plt.tight_layout()
+        st.pyplot(fig)
+
 else:
     fig, ax = plt.subplots(figsize=(4, 14))
-    runs, cur, start, prev = [], None, None, None
-    for _, r in sub.iterrows():
-        if r["LITHOLOGY"] != cur:
-            if cur is not None: runs.append((start, prev, cur))
-            cur, start = r["LITHOLOGY"], r["DEPT"]
-        prev = r["DEPT"]
-    if cur is not None: runs.append((start, prev, cur))
-    for s, e, lab in runs:
-        ax.barh((s + e) / 2, 1.0, height=(e - s),
-                color=LITH_COLORS.get(lab, "#888"), edgecolor="k", lw=0.4)
-    ax.set_xlim(0, 1); ax.set_xticks([]); ax.invert_yaxis()
-    ax.set_ylabel("Depth (ft)"); ax.set_title("Lithology")
-    ax.legend(handles=[Patch(facecolor=c, label=n) for n, c in LITH_COLORS.items()],
-              loc="upper right", fontsize=9)
-    plt.tight_layout(); st.pyplot(fig)
 
-st.subheader("4. Download")
-st.download_button("Predictions (CSV)",
-                   data=df_pred[show].to_csv(index=False),
-                   file_name=f"{well}_lithology.csv", mime="text/csv")
+    runs, cur, start, prev = [], None, None, None
+    for _, row in sub.iterrows():
+        lab = row["LITHOLOGY"]
+        if lab != cur:
+            if cur is not None:
+                runs.append((start, prev, cur))
+            cur, start = lab, row["DEPT"]
+        prev = row["DEPT"]
+    if cur is not None:
+        runs.append((start, prev, cur))
+
+    for s, e, lab in runs:
+        if lab == "Unknown":
+            ax.barh((s + e) / 2.0, 1.0, height=(e - s),
+                    color="#bbbbbb", edgecolor="#666",
+                    hatch="//", linewidth=0.3)
+        else:
+            ax.barh((s + e) / 2.0, 1.0, height=(e - s),
+                    color=LITH_COLORS.get(lab, "#888"),
+                    edgecolor="k", lw=0.4)
+
+    ax.set_xlim(0, 1)
+    ax.set_xticks([])
+    ax.invert_yaxis()
+    ax.set_ylabel("Depth (ft)")
+    ax.set_title("Lithology")
+
+    handles = [Patch(facecolor=LITH_COLORS[c], label=c) for c in class_names]
+    handles.append(Patch(facecolor="#bbbbbb", edgecolor="#666",
+                         hatch="//", label="Unknown"))
+    ax.legend(handles=handles, loc="upper right", fontsize=9)
+
+    plt.tight_layout()
+    st.pyplot(fig)
+
+# Downloads
+st.subheader("4. Download results")
+st.download_button(
+    "Predictions (CSV)",
+    data=df_pred[show_cols].to_csv(index=False),
+    file_name=f"{well}_lithology.csv",
+    mime="text/csv",
+)
 
