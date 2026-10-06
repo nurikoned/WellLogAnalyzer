@@ -19,7 +19,7 @@ Original file is located at
 # joblib.dump(model, 'model.pkl')
 
 # -*- coding: utf-8 -*-
-"""Kansas Basin Well Log Analyzer — v64 with uncertainty flagging"""
+"""Kansas Basin Well Log Analyzer"""
 
 import streamlit as st
 import lasio
